@@ -3,11 +3,10 @@ package reutersjp
 import (
 	"NewsChannel/news"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
-
-	"github.com/PuerkitoBio/goquery"
 )
 
 func (r *ReutersJP) getArticles(url string, topic news.Topic) ([]news.Article, error) {
@@ -50,15 +49,25 @@ func (r *ReutersJP) createArticle(story map[string]any, topic news.Topic) (*news
 	r.oldArticleTitles = append(r.oldArticleTitles, title)
 
 	articlePath := story["canonical_url"]
-	articleURL := fmt.Sprintf("https://jp.reuters.com%s", articlePath)
+	articleURL := fmt.Sprintf("https://jp.reuters.com/pf/api/v3/content/fetch/article-by-id-or-url-v1?query={\"website_url\":\"%s\",\"website\":\"reuters-japan\"}", articlePath)
 	articleData, err := news.HttpGet(articleURL)
 	if err != nil {
 		return nil, err
 	}
 
-	article := string(articleData)
+	// Parse article JSON
+	var articleJSON map[string]any
+	err = json.Unmarshal(articleData, &articleJSON)
+	if err != nil {
+		var serr *json.SyntaxError
+		if errors.As(err, &serr) {
+			return nil, nil
+		}
 
-	content, locationString, err := extractArticleBody(article)
+		return nil, err
+	}
+
+	content, locationString, err := parseArticle(articleJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -93,41 +102,46 @@ func (r *ReutersJP) createArticle(story map[string]any, topic news.Topic) (*news
 	}, nil
 }
 
-func extractArticleBody(html string) (*string, *string, error) {
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
-	if err != nil {
-		return nil, nil, err
+func parseArticle(root map[string]any) (*string, *string, error) {
+	var ret string
+
+	if root["result"] == nil {
+		return nil, nil, nil
 	}
 
-	var contentSlice []string
-
-	// Select the main article body div
-	doc.Find(`div.article-body-module__content__bnXL1`).Each(func(i int, section *goquery.Selection) {
-		section.Find("div.article-body-module__paragraph__Ts-yF").Each(func(j int, elem *goquery.Selection) {
-			text := strings.TrimSpace(elem.Text())
-			if text != "" {
-				contentSlice = append(contentSlice, text)
-			}
-		})
-	})
-
-	var result string
-
-	for _, content := range contentSlice {
-		result += news.SanitizeText(content)
-		result += "\n\n"
+	article := root["result"].(map[string]any)
+	if article["content_elements"] == nil {
+		return nil, nil, nil
 	}
 
-	result = strings.TrimSpace(result)
+	for _, content := range article["content_elements"].([]any) {
+		if content.(map[string]any)["type"].(string) != "paragraph" {
+			continue
+		}
+
+		// Sanitize paragraph
+		unSanitized := content.(map[string]any)["content"].(string)
+		sanitized := news.SanitizeText(unSanitized)
+
+		ret += sanitized
+		ret += "\n\n"
+	}
+
+	ret = strings.TrimSpace(ret)
 
 	// Get the location
-	dateline := regexp.MustCompile(`([\[|［])(.*?)[０-９]`)
-	location := dateline.FindStringSubmatch(contentSlice[0])
-	if len(location) > 2 && len(location[2]) > 0 {
-		return &result, &location[2], nil
+	if article["dateline"] != nil {
+		datelines := article["dateline"].([]any)
+		if len(datelines) > 0 {
+			dateline := regexp.MustCompile(`([\[|［])(.*?)[０-９]`)
+			location := dateline.FindStringSubmatch(datelines[0].(string))
+			if len(location) > 2 && len(location[2]) > 0 {
+				return &ret, &location[2], nil
+			}
+		}
 	}
 
-	return &result, nil, nil
+	return &ret, nil, nil
 }
 
 func getThumbnail(story map[string]any) (*news.Thumbnail, error) {
